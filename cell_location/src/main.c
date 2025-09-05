@@ -10,13 +10,18 @@
 #include <modem/lte_lc.h>
 #include <modem/location.h>
 #include <modem/nrf_modem_lib.h>
-
+#include <date_time.h>
 
 static K_SEM_DEFINE(location_event, 0, 1);
 
 static K_SEM_DEFINE(lte_connected, 0, 1);
 
+static K_SEM_DEFINE(time_update_finished, 0, 1);
 
+static void date_time_evt_handler(const struct date_time_evt *evt)
+{
+	k_sem_give(&time_update_finished);
+}
 
 static void lte_event_handler(const struct lte_lc_evt *const evt)
 {
@@ -114,7 +119,9 @@ int main(void)
 		return err;
 	}
 
-
+	if (IS_ENABLED(CONFIG_DATE_TIME)) {
+		date_time_register_handler(date_time_evt_handler);
+	}
 
 	printk("Connecting to LTE...\n");
 
@@ -123,7 +130,13 @@ int main(void)
 	lte_lc_connect();
 	k_sem_take(&lte_connected, K_FOREVER);
 
-
+	if (IS_ENABLED(CONFIG_DATE_TIME)) {
+		printk("Waiting for current time\n");
+		k_sem_take(&time_update_finished, K_MINUTES(10));
+		if (!date_time_is_valid()) {
+			printk("Failed to get current time. Continuing anyway.\n");
+		}
+	}
 
 	err = location_init(location_event_handler);
 	if (err) {
