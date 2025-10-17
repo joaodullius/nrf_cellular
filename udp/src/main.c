@@ -197,6 +197,9 @@ int main(void)
 	}
 #endif
 
+	LOG_INF("Waiting 10 seconds before connecting to LTE network...");
+	k_sleep(K_SECONDS(10));
+
 	err = lte_lc_connect_async(lte_handler);
 	if (err) {
 		LOG_ERR("Failed to connect to LTE network, error: %d", err);
