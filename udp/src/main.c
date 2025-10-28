@@ -15,7 +15,6 @@
 
 #define UDP_IP_HEADER_SIZE 28
 
-static int client_fd;
 static struct sockaddr_storage host_addr;
 static struct k_work_delayable socket_transmission_work;
 static int data_upload_iterations = CONFIG_UDP_DATA_UPLOAD_ITERATIONS;
@@ -25,10 +24,127 @@ K_SEM_DEFINE(modem_shutdown_sem, 0, 1);
 
 LOG_MODULE_REGISTER(udp_sample, LOG_LEVEL_INF);
 
+
+/* Estados possíveis */
+enum connection_state {
+    STATE_DISCONNECTED,
+    STATE_CONNECTED,
+    STATE_SOCKET_CREATED
+};
+
+/* Variáveis de estado */
+static enum connection_state current_state = STATE_DISCONNECTED;
+static struct sockaddr_storage host_addr;
+static int socket_fd = -1;
+
+/* Setar estado de conectado */
+void set_connected_state(void)
+{
+    current_state = STATE_CONNECTED;
+    printk("Estado: CONNECTED\n");
+}
+
+/* Criar socket, conectar e setar estado */
+int create_socket_and_set_state(void)
+{
+	int err;
+	struct sockaddr_in *server4 = ((struct sockaddr_in *)&host_addr);
+
+	/* Configurar endereço do servidor */
+	server4->sin_family = AF_INET;
+	server4->sin_port = htons(CONFIG_UDP_SERVER_PORT);
+	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC, &server4->sin_addr);
+
+	/* Criar socket UDP */
+	socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (socket_fd < 0) {
+		LOG_ERR("Failed to create UDP socket, error: %d", errno);
+		current_state = STATE_DISCONNECTED;
+		return -errno;
+	}
+
+	current_state = STATE_SOCKET_CREATED;
+	LOG_INF("Socket created (fd: %d)", socket_fd);
+
+	/* Conectar ao servidor */
+	err = connect(socket_fd, (struct sockaddr *)&host_addr, sizeof(struct sockaddr_in));
+	if (err < 0) {
+		LOG_ERR("Failed to connect socket, error: %d", errno);
+		close(socket_fd);
+		socket_fd = -1;
+		current_state = STATE_DISCONNECTED;
+		return err;
+	}
+
+	current_state = STATE_CONNECTED;
+	LOG_INF("Socket connected successfully");
+
+	return 0;
+}
+
+/* Verificar estado atual */
+bool is_connected(void)
+{
+    return (current_state == STATE_CONNECTED || 
+            current_state == STATE_SOCKET_CREATED);
+}
+
+bool is_socket_created(void)
+{
+    return (current_state == STATE_SOCKET_CREATED);
+}
+
+/* Limpar e voltar ao estado desconectado */
+void disconnect_and_cleanup(void)
+{
+    if (socket_fd >= 0) {
+        close(socket_fd);
+        socket_fd = -1;
+    }
+    current_state = STATE_DISCONNECTED;
+    printk("Estado: DISCONNECTED\n");
+}
+
+static void lte_handler(const struct lte_lc_evt *const evt);
+
 static void socket_transmission_work_fn(struct k_work *work)
 {
 	int err;
 	char buffer[CONFIG_UDP_DATA_UPLOAD_SIZE_BYTES] = {"\0"};
+
+	if (current_state == STATE_DISCONNECTED) {
+		LOG_INF("Connecting to LTE network...");
+	 	/* Connect to LTE network */
+		err = lte_lc_connect_async(lte_handler);
+		if (err) {
+			LOG_ERR("Failed to connect to LTE network, error: %d", err);
+			return;
+		}
+
+		k_sem_take(&lte_connected_sem, K_FOREVER);
+		set_connected_state();
+
+		LOG_WRN("LTE link is up");
+		int rsrp, snr;
+		modem_info_get_rsrp(&rsrp);
+		modem_info_get_snr(&snr);
+		LOG_INF("Current rsrp: %ddBm", rsrp);
+		LOG_INF("Current snr: %ddB", snr);
+	}
+
+	//Checa se Socket já está criado
+	if (!is_socket_created()) {
+		LOG_WRN("Socket not created. Creating socket...");
+ 	 	/* Criar socket */
+		if (create_socket_and_set_state() == 0) {
+			/* Socket criado com sucesso */
+			LOG_INF("Socket created successfully.");
+		} else {
+			LOG_ERR("Failed to create socket.");
+			return;
+		}
+	}
+
 
 	LOG_INF("Transmitting UDP/IP payload of %d bytes to the IP address %s, port number %d",
 		CONFIG_UDP_DATA_UPLOAD_SIZE_BYTES + UDP_IP_HEADER_SIZE,
@@ -41,7 +157,7 @@ static void socket_transmission_work_fn(struct k_work *work)
 	 */
 	int rai = RAI_LAST;
 
-	err = setsockopt(client_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
+	err = setsockopt(socket_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
 		if (err) {
 			LOG_ERR("Failed to set socket option, error: %d", errno);
 		}
@@ -52,13 +168,13 @@ static void socket_transmission_work_fn(struct k_work *work)
 	 */
 	int rai = RAI_ONGOING;
 
-	err = setsockopt(client_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
+	err = setsockopt(socket_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
 		if (err) {
 			LOG_ERR("Failed to set socket option, error: %d", errno);
 		}
 #endif
 
-	err = send(client_fd, buffer, sizeof(buffer), 0);
+	err = send(socket_fd, buffer, sizeof(buffer), 0);
 	if (err < 0) {
 		LOG_ERR("Failed to transmit UDP packet, error: %d", errno);
 	}
@@ -68,7 +184,7 @@ static void socket_transmission_work_fn(struct k_work *work)
 	 */
 	int rai = RAI_NO_DATA;
 
-	err = setsockopt(client_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
+	err = setsockopt(socket_fd, SOL_SOCKET, SO_RAI, &rai, sizeof(rai));
 		if (err) {
 			LOG_ERR("Failed to set socket option, error: %d", errno);
 		}
@@ -95,8 +211,25 @@ static void work_init(void)
 	k_work_init_delayable(&socket_transmission_work, socket_transmission_work_fn);
 }
 
+
+//Define Modem Shutdown Workqueue function
+static void modem_shutdown_handler(struct k_work *work)
+{
+    // Your work processing code here
+	LOG_WRN("Modem shutdown workqueue handler invoked.");
+
+	disconnect_and_cleanup();
+	k_sleep(K_MSEC(100));
+	lte_lc_power_off();
+	//nrf_modem_lib_shutdown();
+}
+
+// Define the work item using the macro
+static K_WORK_DEFINE(modem_shutdown_wk, modem_shutdown_handler);
+
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
+	
 	switch (evt->type) {
 	case LTE_LC_EVT_NW_REG_STATUS:
 		if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
@@ -117,10 +250,22 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 	 LOG_INF("eDRX parameter update: eDRX: %.2f s, PTW: %.2f s",
 		 (double)evt->edrx_cfg.edrx, (double)evt->edrx_cfg.ptw);
 		break;
+
 	case LTE_LC_EVT_RRC_UPDATE:
-	 LOG_INF("RRC mode: %s",
-		 evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ? "Connected" : "Idle");
-		break;
+	    if (current_state == STATE_DISCONNECTED) {
+        // Ignore events after disconnect
+        break;
+    }
+	LOG_INF("RRC mode: %s",
+            evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ? "Connected" : "Idle");
+        if (evt->rrc_mode == LTE_LC_RRC_MODE_IDLE) {
+            // RRC released, now disconnect and power off modem
+           LOG_WRN("RRC connection released, shutting down modem");
+		   k_work_submit(&modem_shutdown_wk);
+            // Optionally, signal your application to stop further processing
+        }
+        break;
+
 	case LTE_LC_EVT_CELL_UPDATE:
 	 LOG_INF("LTE cell changed: Cell ID: %d, Tracking area: %d",
 		 evt->cell.id, evt->cell.tac);
@@ -139,32 +284,6 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 	}
 }
 
-static int socket_connect(void)
-{
-	int err;
-	struct sockaddr_in *server4 = ((struct sockaddr_in *)&host_addr);
-
-	server4->sin_family = AF_INET;
-	server4->sin_port = htons(CONFIG_UDP_SERVER_PORT);
-
-	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC, &server4->sin_addr);
-
-	client_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (client_fd < 0) {
-		LOG_ERR("Failed to create UDP socket, error: %d", errno);
-		err = -errno;
-		return err;
-	}
-
-	err = connect(client_fd, (struct sockaddr *)&host_addr, sizeof(struct sockaddr_in));
-	if (err < 0) {
-		LOG_ERR("Failed to connect socket, error: %d", errno);
-		close(client_fd);
-		return err;
-	}
-
-	return 0;
-}
 
 int main(void)
 {
@@ -200,24 +319,26 @@ int main(void)
 	LOG_INF("Waiting 10 seconds before connecting to LTE network...");
 	k_sleep(K_SECONDS(10));
 
-	err = lte_lc_connect_async(lte_handler);
-	if (err) {
-		LOG_ERR("Failed to connect to LTE network, error: %d", err);
-		return -1;
+	if (current_state == STATE_DISCONNECTED) {
+		LOG_INF("Connecting to LTE network...");
+	 	/* Connect to LTE network */
+		err = lte_lc_connect_async(lte_handler);
+		if (err) {
+			LOG_ERR("Failed to connect to LTE network, error: %d", err);
+			return -1;
+		}
+
+		k_sem_take(&lte_connected_sem, K_FOREVER);
+		set_connected_state();
+
+		LOG_WRN("LTE link is up");
+		int rsrp, snr;
+		modem_info_get_rsrp(&rsrp);
+		modem_info_get_snr(&snr);
+		LOG_INF("Current rsrp: %ddBm", rsrp);
+		LOG_INF("Current snr: %ddB", snr);
 	}
 
-	k_sem_take(&lte_connected_sem, K_FOREVER);
-	LOG_WRN("LTE link is up");
-	int rsrp, snr;
-	modem_info_get_rsrp(&rsrp);
-	modem_info_get_snr(&snr);
-	LOG_INF("Current rsrp: %ddBm", rsrp);
-	LOG_INF("Current snr: %ddB", snr);
-
-	err = socket_connect();
-	if (err) {
-		return -1;
-	}
 
 	k_work_schedule(&socket_transmission_work, K_NO_WAIT);
 
